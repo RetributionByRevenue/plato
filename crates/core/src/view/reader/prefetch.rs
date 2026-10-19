@@ -5,6 +5,10 @@
 //! an already rendered pixmap. If the requested page is being rendered when
 //! the reader needs it, the reader waits for that render instead of doing
 //! the same work a second time on the UI thread.
+//!
+//! Every page the worker renders also goes to the on-disk page cache, and
+//! once the nearby pages are ready it keeps rendering further ahead into
+//! that cache, so even quick page turns usually find their page done.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,6 +19,7 @@ use crate::geom::Rectangle;
 use crate::metadata::{Margin, ZoomMode};
 use crate::device::CURRENT_DEVICE;
 use super::{scaling_factor, Resource};
+use super::page_cache::{PageCache, trim_cache};
 
 // Rendered pages waiting to be picked up (each one is ~2.6 MB on an rM2).
 const MAX_READY: usize = 4;
@@ -48,27 +53,37 @@ pub fn render_resource(doc: &mut dyn Document, location: usize, params: &RenderP
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Target {
+    Memory, // Wanted soon: keep the result for the reader.
+    Disk,   // Further ahead: only make sure it's in the page cache.
+}
+
 struct Job {
     location: usize,
     params: RenderParams,
+    target: Target,
 }
 
 #[derive(Default)]
 struct State {
     queue: Vec<Job>,  // Highest priority first.
     in_flight: Option<(usize, RenderParams)>,
-    ready: Vec<(usize, RenderParams, Resource)>,
+    ready: Vec<(usize, RenderParams, Resource, Target)>,
     quit: bool,
 }
 
 pub struct Prefetcher {
     shared: Arc<(Mutex<State>, Condvar)>,
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl Prefetcher {
     pub fn new(path: PathBuf) -> Prefetcher {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let shared2 = Arc::clone(&shared);
+        let page_cache = PageCache::new(&path).map(Arc::new);
+        let page_cache2 = page_cache.clone();
 
         thread::Builder::new().name("prefetch".to_string()).spawn(move || {
             // Stay out of the way of the UI thread on this dual core device.
@@ -96,38 +111,71 @@ impl Prefetcher {
                     job
                 };
 
-                let resource = timed!(format!("pixmap p{} (prefetch)", job.location),
-                                      render_resource(doc.as_mut(), job.location, &job.params));
+                let cached = page_cache2.as_ref().and_then(|pc| {
+                    if job.target == Target::Disk {
+                        // Already there: nothing to do.
+                        pc.contains(job.location, &job.params).then_some(None)
+                    } else {
+                        timed!(format!("disk p{} (prefetch)", job.location),
+                               pc.load(job.location, &job.params)).map(Some)
+                    }
+                });
+
+                let resource = match cached {
+                    Some(Some(resource)) => Some(resource),
+                    Some(None) => None,
+                    None => {
+                        let resource = timed!(format!("pixmap p{} (prefetch)", job.location),
+                                              render_resource(doc.as_mut(), job.location, &job.params));
+                        if let Some(pc) = page_cache2.as_ref() {
+                            timed!(format!("store p{}", job.location), pc.store(job.location, &job.params, &resource));
+                        }
+                        Some(resource)
+                    },
+                };
 
                 let mut state = lock.lock().unwrap();
                 state.in_flight = None;
-                state.ready.push((job.location, job.params, resource));
-                if state.ready.len() > MAX_READY {
-                    state.ready.remove(0);
+                if let Some(resource) = resource {
+                    state.ready.push((job.location, job.params, resource, job.target));
+                    while state.ready.len() > MAX_READY {
+                        // Drop look-ahead results before the ones asked for.
+                        let i = state.ready.iter().position(|r| r.3 == Target::Disk).unwrap_or(0);
+                        state.ready.remove(i);
+                    }
                 }
                 cvar.notify_all();
             }
         }).ok();
 
-        Prefetcher { shared }
+        // Keep the page cache within its size limit, at the lowest priority.
+        thread::spawn(|| {
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19); }
+            trim_cache();
+        });
+
+        Prefetcher { shared, page_cache }
     }
 
-    // Replaces the pending work with `locations` (highest priority first).
-    pub fn request(&self, locations: &[usize], params_for: impl Fn(usize) -> RenderParams) {
+    // Replaces the pending work: `soon` are kept in memory (highest priority
+    // first), `ahead` are only rendered into the page cache.
+    pub fn request(&self, soon: &[usize], ahead: &[usize], params_for: impl Fn(usize) -> RenderParams) {
         let (lock, cvar) = &*self.shared;
         let mut state = lock.lock().unwrap();
         if state.quit {
             return;
         }
-        let jobs: Vec<Job> = locations.iter().filter_map(|&location| {
+        let wanted = soon.iter().map(|&l| (l, Target::Memory))
+                         .chain(ahead.iter().map(|&l| (l, Target::Disk)));
+        let jobs: Vec<Job> = wanted.filter_map(|(location, target)| {
             let params = params_for(location);
-            let done = state.ready.iter().any(|(l, p, _)| *l == location && *p == params) ||
+            let done = state.ready.iter().any(|(l, p, _, _)| *l == location && *p == params) ||
                        state.in_flight.as_ref().is_some_and(|(l, p)| *l == location && *p == params);
-            if done { None } else { Some(Job { location, params }) }
+            if done { None } else { Some(Job { location, params, target }) }
         }).collect();
         state.queue = jobs;
         // Results nobody asked for any more only hold on to memory.
-        state.ready.retain(|(l, _, _)| locations.contains(l));
+        state.ready.retain(|(l, _, _, _)| soon.contains(l) || ahead.contains(l));
         cvar.notify_all();
     }
 
@@ -137,7 +185,7 @@ impl Prefetcher {
         let mut state = lock.lock().unwrap();
         state.queue.retain(|job| job.location != location);
         loop {
-            if let Some(i) = state.ready.iter().position(|(l, p, _)| *l == location && p == params) {
+            if let Some(i) = state.ready.iter().position(|(l, p, _, _)| *l == location && p == params) {
                 return Some(state.ready.remove(i).2);
             }
             let rendering = state.in_flight.as_ref().is_some_and(|(l, p)| *l == location && p == params);
@@ -146,6 +194,10 @@ impl Prefetcher {
             }
             state = cvar.wait(state).unwrap();
         }
+    }
+
+    pub fn page_cache(&self) -> Option<&Arc<PageCache>> {
+        self.page_cache.as_ref()
     }
 }
 

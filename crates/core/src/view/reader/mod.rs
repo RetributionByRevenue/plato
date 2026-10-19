@@ -5,6 +5,7 @@ mod margin_cropper;
 mod chapter_label;
 mod results_label;
 mod prefetch;
+mod page_cache;
 
 use std::thread;
 use std::sync::{Arc, Mutex};
@@ -66,6 +67,8 @@ const RECT_DIST_JITTER: f32 = 24.0;
 const ANNOTATION_DRIFT: u8 =  0x44;
 const HIGHLIGHT_DRIFT: u8 =  0x22;
 const MEM_SCHEME: &str = "mem:";
+// Pages rendered into the page cache beyond the two kept in memory.
+const PREFETCH_AHEAD: usize = 10;
 
 pub struct Reader {
     id: Id,
@@ -508,9 +511,22 @@ impl Reader {
             return;
         }
 
+        let page_cache = self.prefetcher.as_ref().and_then(|p| p.page_cache().cloned());
+
+        if let Some(resource) = page_cache.as_ref()
+                                          .and_then(|pc| timed!(format!("disk p{}", location), pc.load(location, &params))) {
+            self.cache.insert(location, resource);
+            return;
+        }
+
         let mut doc = self.doc.lock().unwrap();
         let resource = timed!(format!("pixmap p{} (ui thread)", location),
                               render_resource(doc.as_mut(), location, &params));
+        if let Some(pc) = page_cache {
+            // Compressing takes a moment; don't make the page turn wait for it.
+            let copy = Resource { pixmap: resource.pixmap.clone(), frame: resource.frame, scale: resource.scale };
+            thread::spawn(move || pc.store(location, &params, &copy));
+        }
         self.cache.insert(location, resource);
     }
 
@@ -1198,18 +1214,28 @@ impl Reader {
         let Some(prefetcher) = self.prefetcher.as_ref() else {
             return;
         };
-        let wanted = {
+        let (soon, ahead) = {
             let mut doc = self.doc.lock().unwrap();
-            let next = doc.resolve_location(Location::Next(last_location));
-            let next2 = next.and_then(|n| doc.resolve_location(Location::Next(n)));
-            let prev = doc.resolve_location(Location::Previous(first_location));
-            let prev2 = prev.and_then(|p| doc.resolve_location(Location::Previous(p)));
-            if self.forward { [next, next2, prev] } else { [prev, prev2, next] }
+            let mut walk = |start: usize, forward: bool, count: usize| {
+                let mut locations = Vec::with_capacity(count);
+                let mut location = start;
+                while locations.len() < count {
+                    let neighbor = if forward { Location::Next(location) } else { Location::Previous(location) };
+                    match doc.resolve_location(neighbor) {
+                        Some(n) => { locations.push(n); location = n; },
+                        None => break,
+                    }
+                }
+                locations
+            };
+            let (front, back) = if self.forward { (last_location, first_location) } else { (first_location, last_location) };
+            let mut onward = walk(front, self.forward, 2 + PREFETCH_AHEAD);
+            let behind = walk(back, !self.forward, 1);
+            let ahead = onward.split_off(onward.len().min(2));
+            (onward.into_iter().chain(behind).collect::<Vec<_>>(), ahead)
         };
-        let wanted: Vec<usize> = wanted.into_iter().flatten()
-                                       .filter(|loc| !self.cache.contains_key(loc))
-                                       .collect();
-        prefetcher.request(&wanted, |location| self.render_params(location));
+        let soon: Vec<usize> = soon.into_iter().filter(|loc| !self.cache.contains_key(loc)).collect();
+        prefetcher.request(&soon, &ahead, |location| self.render_params(location));
     }
 
     fn search(&mut self, text: &str, query: Regex, hub: &Hub, rq: &mut RenderQueue) {
