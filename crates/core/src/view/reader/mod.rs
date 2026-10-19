@@ -4,6 +4,7 @@ mod results_bar;
 mod margin_cropper;
 mod chapter_label;
 mod results_label;
+mod prefetch;
 
 use std::thread;
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,7 @@ use super::top_bar::TopBar;
 use self::tool_bar::ToolBar;
 use self::bottom_bar::BottomBar;
 use self::results_bar::ResultsBar;
+use self::prefetch::{Prefetcher, RenderParams, render_resource};
 use crate::view::common::{locate, rlocate, locate_by_id};
 use crate::view::common::{toggle_main_menu, toggle_battery_menu, toggle_clock_menu};
 use crate::view::filler::Filler;
@@ -71,6 +73,9 @@ pub struct Reader {
     children: Vec<Box<dyn View>>,
     doc: Arc<Mutex<Box<dyn Document>>>,
     cache: BTreeMap<usize, Resource>,                // Cached page pixmaps.
+    prefetcher: Option<Prefetcher>,                  // Renders upcoming pages in the background.
+    forward: bool,                                   // Direction of the last page turn.
+    doc_toc: Option<Option<Vec<TocEntry>>>,          // The document's outline, parsed once.
     chunks: Vec<RenderChunk>,                        // Chunks of pages being rendered.
     text: FxHashMap<usize, Vec<BoundedText>>,        // Text of the current chunks.
     annotations: FxHashMap<usize, Vec<Annotation>>,  // Annotations for the current chunks.
@@ -177,6 +182,15 @@ impl Default for Contrast {
             gray: DEFAULT_CONTRAST_GRAY,
         }
     }
+}
+
+// Parsing the outline walks the whole page tree, so fixed-layout documents
+// (whose outline never changes) only do it once.
+fn cached_doc_toc(cache: &mut Option<Option<Vec<TocEntry>>>, doc: &mut dyn Document, reflowable: bool) -> Option<Vec<TocEntry>> {
+    if reflowable {
+        return doc.toc();
+    }
+    cache.get_or_insert_with(|| doc.toc()).clone()
 }
 
 fn scaling_factor(rect: &Rectangle, cropping_margin: &Margin, screen_margin_width: i32, dims: (f32, f32), zoom_mode: ZoomMode) -> f32 {
@@ -362,12 +376,19 @@ impl Reader {
 
             hub.send(Event::Update(UpdateMode::Partial)).ok();
 
+            // Fixed-layout pages only depend on the page number and the
+            // view port, so they can be rendered ahead of time.
+            let prefetcher = if reflowable { None } else { Some(Prefetcher::new(path.clone())) };
+
             Some(Reader {
                 id,
                 rect,
                 children: Vec::new(),
                 doc: Arc::new(Mutex::new(doc)),
                 cache: BTreeMap::new(),
+                prefetcher,
+                forward: true,
+                doc_toc: None,
                 chunks: Vec::new(),
                 text: FxHashMap::default(),
                 annotations: FxHashMap::default(),
@@ -433,6 +454,9 @@ impl Reader {
             children: Vec::new(),
             doc: Arc::new(Mutex::new(Box::new(doc))),
             cache: BTreeMap::new(),
+            prefetcher: None,
+            forward: true,
+            doc_toc: None,
             chunks: Vec::new(),
             text: FxHashMap::default(),
             annotations: FxHashMap::default(),
@@ -458,32 +482,44 @@ impl Reader {
         }
     }
 
+    fn render_params(&self, location: usize) -> RenderParams {
+        let cropping_margin = self.info.reader.as_ref()
+                                  .and_then(|r| r.cropping_margins.as_ref()
+                                                 .map(|c| c.margin(location)))
+                                  .cloned().unwrap_or_default();
+        RenderParams {
+            rect: self.rect,
+            cropping_margin,
+            margin_width: self.view_port.margin_width,
+            zoom_mode: self.view_port.zoom_mode,
+        }
+    }
+
     fn load_pixmap(&mut self, location: usize) {
         if self.cache.contains_key(&location) {
             return;
         }
 
+        let params = self.render_params(location);
+
+        if let Some(resource) = self.prefetcher.as_ref()
+                                    .and_then(|p| timed!(format!("take p{}", location), p.take(location, &params))) {
+            self.cache.insert(location, resource);
+            return;
+        }
+
         let mut doc = self.doc.lock().unwrap();
-        let cropping_margin = self.info.reader.as_ref()
-                                  .and_then(|r| r.cropping_margins.as_ref()
-                                                 .map(|c| c.margin(location)))
-                                  .cloned().unwrap_or_default();
-        let dims = timed!(format!("dims p{}", location), doc.dims(location)).unwrap_or((3.0, 4.0));
-        let screen_margin_width = self.view_port.margin_width;
-        let scale = scaling_factor(&self.rect, &cropping_margin, screen_margin_width, dims, self.view_port.zoom_mode);
-        if let Some((pixmap, _)) = timed!(format!("pixmap p{} (ui thread)", location),
-                                          doc.pixmap(Location::Exact(location), scale, CURRENT_DEVICE.color_samples())) {
-            let frame = rect![(cropping_margin.left * pixmap.width as f32).ceil() as i32,
-                              (cropping_margin.top * pixmap.height as f32).ceil() as i32,
-                              ((1.0 - cropping_margin.right) * pixmap.width as f32).floor() as i32,
-                              ((1.0 - cropping_margin.bottom) * pixmap.height as f32).floor() as i32];
-            self.cache.insert(location, Resource { pixmap, frame, scale });
-        } else {
-            let width = (dims.0 as f32 * scale).max(1.0) as u32;
-            let height = (dims.1 as f32 * scale).max(1.0) as u32;
-            let pixmap = Pixmap::empty(width, height, CURRENT_DEVICE.color_samples());
-            let frame = pixmap.rect();
-            self.cache.insert(location, Resource { pixmap, frame, scale });
+        let resource = timed!(format!("pixmap p{} (ui thread)", location),
+                              render_resource(doc.as_mut(), location, &params));
+        self.cache.insert(location, resource);
+    }
+
+    // Words are only needed for selections, annotations and links, so they
+    // are extracted on demand rather than on every page turn.
+    fn load_chunks_text(&mut self) {
+        let locations: Vec<usize> = self.chunks.iter().map(|c| c.location).collect();
+        for location in locations {
+            self.load_text(location);
         }
     }
 
@@ -536,7 +572,7 @@ impl Reader {
         let loc = {
             let mut doc = self.doc.lock().unwrap();
             if let Some(toc) = self.toc()
-                                   .or_else(|| doc.toc()) {
+                                   .or_else(|| cached_doc_toc(&mut self.doc_toc, doc.as_mut(), self.reflowable)) {
                 let chap_offset = if dir == CycleDir::Previous {
                    doc.chapter(current_page, &toc)
                       .and_then(|(chap, _)| doc.resolve_location(chap.location.clone()))
@@ -560,7 +596,7 @@ impl Reader {
         let mut min_loc = None;
         let mut max_loc = None;
         for chunk in &self.chunks {
-            for word in &self.text[&chunk.location] {
+            for word in self.text.get(&chunk.location).into_iter().flatten() {
                 let rect = (word.rect * chunk.scale).to_rect();
                 if rect.overlaps(&chunk.frame) {
                     if let Some(ref mut min) = min_loc {
@@ -600,6 +636,7 @@ impl Reader {
     }
 
     fn go_to_annotation(&mut self, dir: CycleDir, hub: &Hub, rq: &mut RenderQueue, context: &Context) {
+        self.load_chunks_text();
         let loc_annot = self.info.reader.as_ref().and_then(|r| {
             match dir {
                 CycleDir::Next => self.text_location_range().and_then(|[_, max]| {
@@ -732,6 +769,7 @@ impl Reader {
             return;
         }
 
+        self.forward = dir == CycleDir::Next;
         let current_page = self.current_page;
         let page_offset = self.view_port.page_offset;
 
@@ -749,7 +787,6 @@ impl Reader {
 
                                 loop {
                                     self.load_pixmap(location);
-                                    self.load_text(location);
                                     let Resource { mut frame, .. } = self.cache[&location];
                                     if location == first_chunk.location {
                                         frame.max.y = first_chunk.frame.min.y;
@@ -812,7 +849,6 @@ impl Reader {
                             ScrollMode::Screen => {
                                 let &RenderChunk { location, frame, .. } = self.chunks.last().unwrap();
                                 self.load_pixmap(location);
-                                self.load_text(location);
                                 let pixmap_frame = self.cache[&location].frame;
                                 let next_top_offset = frame.max.y - pixmap_frame.min.y;
                                 if next_top_offset == pixmap_frame.height() as i32 {
@@ -937,7 +973,7 @@ impl Reader {
         if let Some(index) = locate::<BottomBar>(self) {
             let current_page = self.current_page;
             let mut doc = self.doc.lock().unwrap();
-            let rtoc = self.toc().or_else(|| doc.toc());
+            let rtoc = self.toc().or_else(|| cached_doc_toc(&mut self.doc_toc, doc.as_mut(), self.reflowable));
             let chapter = rtoc.as_ref().and_then(|toc| doc.chapter(current_page, toc));
             let title = chapter.map(|(c, _)| c.title.clone())
                                .unwrap_or_default();
@@ -1018,6 +1054,9 @@ impl Reader {
     #[inline]
     fn update_annotations(&mut self) {
         self.annotations.clear();
+        if self.info.reader.as_ref().is_some_and(|r| !r.annotations.is_empty()) {
+            self.load_chunks_text();
+        }
         if let Some(annotations) = self.info.reader.as_ref().map(|r| &r.annotations).filter(|a| !a.is_empty()) {
             for chunk in &self.chunks {
                 let words = &self.text[&chunk.location];
@@ -1037,7 +1076,7 @@ impl Reader {
         }
     }
 
-    fn update(&mut self, update_mode: Option<UpdateMode>, hub: &Hub, rq: &mut RenderQueue, context: &Context) {
+    fn update(&mut self, update_mode: Option<UpdateMode>, _hub: &Hub, rq: &mut RenderQueue, context: &Context) {
         self.page_turns += 1;
         let update_mode = update_mode.unwrap_or_else(|| {
             let pair = context.settings.reader.refresh_rate.by_kind
@@ -1058,7 +1097,6 @@ impl Reader {
         match self.view_port.zoom_mode {
             ZoomMode::FitToPage => {
                 self.load_pixmap(location);
-                self.load_text(location);
                 let Resource { frame, scale, .. } = self.cache[&location];
                 let dx = smw + ((self.rect.width() - frame.width()) as i32 - 2 * smw) / 2;
                 let dy = smw + ((self.rect.height() - frame.height()) as i32 - 2 * smw) / 2;
@@ -1070,7 +1108,6 @@ impl Reader {
                     let mut height = 0;
                     while height < available_height {
                         self.load_pixmap(location);
-                        self.load_text(location);
                         let Resource { mut frame, scale, .. } = self.cache[&location];
                         if location == self.current_page {
                             frame.min.y += self.view_port.page_offset.y;
@@ -1107,7 +1144,6 @@ impl Reader {
                 },
                 ScrollMode::Page => {
                     self.load_pixmap(location);
-                    self.load_text(location);
                     let available_height = self.rect.height() as i32 - 2 * smw;
                     let Resource { mut frame, scale, .. } = self.cache[&location];
                     frame.min.y += self.view_port.page_offset.y;
@@ -1118,7 +1154,6 @@ impl Reader {
             },
             ZoomMode::Custom(_) => {
                 self.load_pixmap(location);
-                self.load_text(location);
                 let Resource { frame, scale, .. } = self.cache[&location];
                 let vpw = self.rect.width() as i32 - 2 * smw;
                 let vph = self.rect.height() as i32 - 2 * smw;
@@ -1134,7 +1169,8 @@ impl Reader {
         let first_location = self.chunks.first().map(|c| c.location).unwrap();
         let last_location = self.chunks.last().map(|c| c.location).unwrap();
 
-        while self.cache.len() > 3 {
+        // Keep the visible pages plus the neighbours the prefetcher fills in.
+        while self.cache.len() > 5 {
             let left_count = self.cache.range(..first_location).count();
             let right_count = self.cache.range(last_location+1..).count();
             let extremum = if left_count >= right_count {
@@ -1148,25 +1184,32 @@ impl Reader {
         self.update_annotations();
         self.update_noninverted_regions(context.fb.inverted());
 
+        self.text.retain(|location, _| self.chunks.iter().any(|c| c.location == *location));
+
         if self.view_port.zoom_mode == ZoomMode::FitToPage ||
            self.view_port.zoom_mode == ZoomMode::FitToWidth {
-            let doc2 = self.doc.clone();
-            let hub2 = hub.clone();
-            thread::spawn(move || {
-                let mut doc = doc2.lock().unwrap();
-                if let Some(next_location) = doc.resolve_location(Location::Next(last_location)) {
-                    hub2.send(Event::LoadPixmap(next_location)).ok();
-                }
-            });
-            let doc3 = self.doc.clone();
-            let hub3 = hub.clone();
-            thread::spawn(move || {
-                let mut doc = doc3.lock().unwrap();
-                if let Some(previous_location) = doc.resolve_location(Location::Previous(first_location)) {
-                    hub3.send(Event::LoadPixmap(previous_location)).ok();
-                }
-            });
+            self.prefetch_neighbors(first_location, last_location);
         }
+    }
+
+    // Asks the background renderer for the pages most likely to come next:
+    // two ahead in the reading direction, then one behind.
+    fn prefetch_neighbors(&mut self, first_location: usize, last_location: usize) {
+        let Some(prefetcher) = self.prefetcher.as_ref() else {
+            return;
+        };
+        let wanted = {
+            let mut doc = self.doc.lock().unwrap();
+            let next = doc.resolve_location(Location::Next(last_location));
+            let next2 = next.and_then(|n| doc.resolve_location(Location::Next(n)));
+            let prev = doc.resolve_location(Location::Previous(first_location));
+            let prev2 = prev.and_then(|p| doc.resolve_location(Location::Previous(p)));
+            if self.forward { [next, next2, prev] } else { [prev, prev2, next] }
+        };
+        let wanted: Vec<usize> = wanted.into_iter().flatten()
+                                       .filter(|loc| !self.cache.contains_key(loc))
+                                       .collect();
+        prefetcher.request(&wanted, |location| self.render_params(location));
     }
 
     fn search(&mut self, text: &str, query: Regex, hub: &Hub, rq: &mut RenderQueue) {
@@ -1597,12 +1640,13 @@ impl Reader {
                 next_page: doc.resolve_location(Location::Next(self.current_page)),
             };
 
+            let toc = self.toc().or_else(|| cached_doc_toc(&mut self.doc_toc, doc.as_mut(), self.reflowable));
             let bottom_bar = BottomBar::new(rect![self.rect.min.x,
                                                   self.rect.max.y - small_height + big_thickness,
                                                   self.rect.max.x,
                                                   self.rect.max.y],
                                             doc.as_mut(),
-                                            self.toc(),
+                                            toc,
                                             self.current_page,
                                             self.pages_count,
                                             &neighbors,
@@ -2871,8 +2915,9 @@ impl View for Reader {
                 let dmax = (scale_by_dpi(RECT_DIST_JITTER, CURRENT_DEVICE.dpi) as i32).pow(2) as u32;
                 let mut rects = Vec::new();
 
+                self.load_chunks_text();
                 for chunk in &self.chunks {
-                    for word in &self.text[&chunk.location] {
+                    for word in self.text.get(&chunk.location).into_iter().flatten() {
                         let rect = (word.rect * chunk.scale).to_rect() - chunk.frame.min + chunk.position;
                         rects.push((rect, word.location));
                         let d = position.rdist2(&rect);
@@ -2970,8 +3015,9 @@ impl View for Reader {
                 let dmax = (scale_by_dpi(RECT_DIST_JITTER, CURRENT_DEVICE.dpi) as i32).pow(2) as u32;
                 let mut rects = Vec::new();
 
+                self.load_chunks_text();
                 for chunk in &self.chunks {
-                    for word in &self.text[&chunk.location] {
+                    for word in self.text.get(&chunk.location).into_iter().flatten() {
                         let rect = (word.rect * chunk.scale).to_rect() - chunk.frame.min + chunk.position;
                         rects.push((rect, word.location));
                         let d = center.rdist2(&rect);
@@ -3287,8 +3333,9 @@ impl View for Reader {
                     return true;
                 }
 
+                self.load_chunks_text();
                 for chunk in &self.chunks {
-                    for word in &self.text[&chunk.location] {
+                    for word in self.text.get(&chunk.location).into_iter().flatten() {
                         let rect = (word.rect * chunk.scale).to_rect() - chunk.frame.min + chunk.position;
                         let d = center.rdist2(&rect);
                         if d < dmax && d < dmin {
@@ -3596,7 +3643,7 @@ impl View for Reader {
                 }
                 let mut doc = self.doc.lock().unwrap();
                 if let Some(toc) = self.toc()
-                                       .or_else(|| doc.toc())
+                                       .or_else(|| cached_doc_toc(&mut self.doc_toc, doc.as_mut(), self.reflowable))
                                        .filter(|toc| !toc.is_empty()) {
                     let chap = doc.chapter(self.current_page, &toc)
                                   .map(|(c, _)| c);
