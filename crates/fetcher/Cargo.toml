@@ -1,7 +1,7 @@
 [package]
 authors = ["Bastien Dejean <nihilhill@gmail.com>"]
 name = "fetcher"
-version = "0.9.44-perf.4"
+version = "0.9.44-perf.5"
 edition = "2021"
 
 [[bin]]

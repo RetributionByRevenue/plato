@@ -148,11 +148,14 @@ impl Prefetcher {
             }
         }).ok();
 
-        // Keep the page cache within its size limit, at the lowest priority.
-        thread::spawn(|| {
-            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19); }
-            trim_cache();
-        });
+        // Drop the other books' pages and keep the cache within its size
+        // limit, at the lowest priority.
+        if let Some(keep) = page_cache.as_ref().map(|pc| pc.dir.clone()) {
+            thread::spawn(move || {
+                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19); }
+                trim_cache(&keep);
+            });
+        }
 
         Prefetcher { shared, page_cache }
     }

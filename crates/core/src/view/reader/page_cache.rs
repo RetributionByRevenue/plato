@@ -2,8 +2,9 @@
 //!
 //! Scanned books can take seconds per page to render on a reMarkable 2, so
 //! every rendered page is stored (zstd compressed) and reused the next time
-//! it's needed, including after Plato restarts. The cache is bounded and the
-//! least recently used pages are removed first.
+//! it's needed, including after Plato restarts. Only the book being read is
+//! kept: opening a book removes the pages of every other one. The cache is
+//! also bounded, and the least recently used pages are removed first.
 //!
 //! PLATO_PAGE_CACHE=0 disables it, PLATO_PAGE_CACHE_MB sets its size.
 
@@ -18,10 +19,10 @@ use super::Resource;
 use super::prefetch::RenderParams;
 
 const MAGIC: &[u8; 8] = b"PLATOPC1";
-const DEFAULT_LIMIT_MB: u64 = 1536;
+const DEFAULT_LIMIT_MB: u64 = 1024;
 
 pub struct PageCache {
-    dir: PathBuf,
+    pub dir: PathBuf,
 }
 
 fn cache_root() -> Option<PathBuf> {
@@ -113,9 +114,22 @@ impl PageCache {
     }
 }
 
-// Removes the least recently used pages until the cache fits its limit.
-pub fn trim_cache() {
+// Removes the pages of every book but the one in `keep`, then the least
+// recently used pages until the cache fits its limit.
+pub fn trim_cache(keep: &Path) {
     let Some(root) = cache_root() else { return };
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path != keep {
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).ok();
+                } else {
+                    fs::remove_file(&path).ok();
+                }
+            }
+        }
+    }
     let limit = std::env::var("PLATO_PAGE_CACHE_MB").ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(DEFAULT_LIMIT_MB) * 1024 * 1024;

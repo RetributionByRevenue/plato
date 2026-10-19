@@ -16,4 +16,4 @@ run inside `ghcr.io/toltec-dev/rust:v4.0` like Vellum's VELBUILD.
 Set `DOCKER="sudo docker"` if your user is not in the docker group.
 
 Runtime knobs: `PLATO_TIMING=1`, `PLATO_QTFB=0`, `PLATO_QTFB_REFRESH_MODE`,
-`PLATO_QTFB_FULL_REFRESH=0`, `PLATO_PAGE_CACHE=0`, `PLATO_PAGE_CACHE_MB`.
+`PLATO_QTFB_FULL_REFRESH=0`, `PLATO_PAGE_CACHE=0`, `PLATO_PAGE_CACHE_MB` (default 1024; only the open book is kept).
