@@ -14,6 +14,9 @@
 
 5. Read only the codestream header for those lazily loaded images (MuPDF's
    fz_load_jpx_info decodes the whole image just to report its size).
+6. Decode unmasked colour JPX one level lower when that still covers 7/8
+   of the displayed size (book covers that are just under twice the
+   screen size were decoded in full).
 
 Idempotent: running it twice leaves the tree unchanged.
 """
@@ -385,3 +388,35 @@ decode_now:
 		pix = fz_load_jpx(ctx, data, len, colorspace);
 """),
 ], MARK2)
+
+
+MARK3 = "/* plato-jpx-near */"
+
+patch("source/fitz/image.c", [
+    ("""					l2factor++;
+					extra++;
+				}
+		}
+	}
+""",
+     """					l2factor++;
+					extra++;
+				}
+		}
+		/* plato-jpx-near */
+		/* Unmasked colour JPX (covers, MRC backgrounds) that is only a
+		 * little larger than needed, which the search above leaves at full
+		 * size: decode it one level lower when that still gives at least
+		 * 7/8 of the size. That is 4x less decoding, and the small upscale
+		 * doesn't show on e-ink. Grey images, usually text, keep their
+		 * full resolution. */
+		else if (image->n >= 3 && l2factor < 6 &&
+			image->w>>(l2factor+1) >= w*7/8 && image->h>>(l2factor+1) >= h*7/8)
+		{
+			fz_compressed_buffer *cbuf = fz_compressed_image_buffer(ctx, image);
+			if (cbuf && cbuf->params.type == FZ_IMAGE_JPX)
+				l2factor++;
+		}
+	}
+"""),
+], mark=MARK3)
