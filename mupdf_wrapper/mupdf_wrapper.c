@@ -31,7 +31,7 @@ WRAP(new_stext_page_from_page, fz_stext_page*, NULL, fz_new_stext_page_from_page
 
 typedef struct {
 	fz_device super;
-	int part;
+	int *next; /* Shared: the first image neither thread has taken yet. */
 	int count;
 } predecode_device;
 
@@ -40,20 +40,25 @@ typedef struct {
 	fz_display_list *list;
 	fz_matrix ctm;
 	fz_pixmap *dest; /* NULL: decode images, otherwise: draw into this band. */
-	int part;
+	int *next;
 	int failed;
 } render_job;
 
-/* Decodes every other image, the way the draw device will ask for it, so
- * that it finds the result in the store. */
+/* Decodes the images the other thread hasn't taken, the way the draw device
+ * will ask for them, so that it finds the results in the store. Both threads
+ * see the images in the same order; each takes the next one when it's free,
+ * so a long decode on one side doesn't hold up the rest. */
 static void predecode(fz_context *ctx, fz_device *dev_, fz_image *image, fz_matrix ctm)
 {
 	predecode_device *dev = (predecode_device *)dev_;
 	fz_pixmap *pix = NULL;
+	int index = dev->count++;
 
 	fz_var(pix);
 
-	if (dev->count++ % 2 != dev->part || image->w == 0 || image->h == 0)
+	if (!__atomic_compare_exchange_n(dev->next, &index, index + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return;
+	if (image->w == 0 || image->h == 0)
 		return;
 
 	ctm = fz_gridfit_matrix(0, ctm);
@@ -101,7 +106,7 @@ static void run_job(render_job *job)
 			pd->super.fill_image = predecode_fill_image;
 			pd->super.fill_image_mask = predecode_fill_image_mask;
 			pd->super.clip_image_mask = predecode_clip_image_mask;
-			pd->part = job->part;
+			pd->next = job->next;
 			dev = &pd->super;
 			fz_run_display_list(ctx, job->list, dev, job->ctm, fz_infinite_rect, NULL);
 		}
@@ -149,7 +154,7 @@ static fz_pixmap *new_pixmap_from_page_parallel(fz_context *ctx, fz_page *page, 
 	fz_pixmap *bands[2] = { NULL, NULL };
 	render_job jobs[2];
 	fz_irect bbox, top, bottom;
-	int mid, i;
+	int mid, i, next = 0;
 
 	fz_var(list);
 	fz_var(pix);
@@ -170,7 +175,7 @@ static fz_pixmap *new_pixmap_from_page_parallel(fz_context *ctx, fz_page *page, 
 		{
 			jobs[i].list = list;
 			jobs[i].ctm = ctm;
-			jobs[i].part = i;
+			jobs[i].next = &next;
 		}
 		/* A failure here only means the bands decode for themselves. */
 		run_jobs(ctx, jobs);

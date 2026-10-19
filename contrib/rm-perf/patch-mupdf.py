@@ -17,6 +17,9 @@
 6. Decode unmasked colour JPX one level lower when that still covers 7/8
    of the displayed size (book covers that are just under twice the
    screen size were decoded in full).
+7. Let JPX images decode in parallel: OpenJPEG allocates with malloc/free
+   instead of through a global context pointer guarded by a process-wide
+   lock (Plato uses the default allocator anyway).
 
 Idempotent: running it twice leaves the tree unchanged.
 """
@@ -420,3 +423,98 @@ patch("source/fitz/image.c", [
 	}
 """),
 ], mark=MARK3)
+
+
+MARK4 = "/* plato-jpx-unlocked */"
+
+# OpenJPEG's allocations go through opj_malloc & co, which MuPDF routes to
+# the context of the decode in progress through one global variable, so it
+# only lets one JPX image decode at a time in the whole process. Plato uses
+# the default allocator, so plain malloc/free do the same job and two pages
+# (or two layers of a page) can decode at once.
+patch("source/fitz/load-jpx.c", [
+    ("""void opj_lock(fz_context *ctx)
+{
+	fz_lock(ctx, FZ_LOCK_FREETYPE);
+
+	set_opj_context(ctx);
+}
+
+void opj_unlock(fz_context *ctx)
+{
+	set_opj_context(NULL);
+
+	fz_unlock(ctx, FZ_LOCK_FREETYPE);
+}
+
+void *opj_malloc(size_t size)
+{
+	fz_context *ctx = get_opj_context();
+
+	assert(ctx != NULL);
+
+	return Memento_label(fz_malloc_no_throw(ctx, size), "opj_malloc");
+}
+
+void *opj_calloc(size_t n, size_t size)
+{
+	fz_context *ctx = get_opj_context();
+
+	assert(ctx != NULL);
+
+	return fz_calloc_no_throw(ctx, n, size);
+}
+
+void *opj_realloc(void *ptr, size_t size)
+{
+	fz_context *ctx = get_opj_context();
+
+	assert(ctx != NULL);
+
+	return fz_realloc_no_throw(ctx, ptr, size);
+}
+
+void opj_free(void *ptr)
+{
+	fz_context *ctx = get_opj_context();
+
+	assert(ctx != NULL);
+
+	fz_free(ctx, ptr);
+}
+""",
+     """/* plato-jpx-unlocked */
+/* Plato uses MuPDF's default allocator (malloc and free), so OpenJPEG can
+ * allocate directly instead of through the context of the decode in
+ * progress, and decodes no longer need to exclude each other. */
+void opj_lock(fz_context *ctx)
+{
+	(void)set_opj_context;
+	(void)get_opj_context;
+}
+
+void opj_unlock(fz_context *ctx)
+{
+}
+
+void *opj_malloc(size_t size)
+{
+	return malloc(size);
+}
+
+void *opj_calloc(size_t n, size_t size)
+{
+	return calloc(n, size);
+}
+
+void *opj_realloc(void *ptr, size_t size)
+{
+	return realloc(ptr, size);
+}
+
+void opj_free(void *ptr)
+{
+	free(ptr);
+}
+"""),
+], mark=MARK4)
