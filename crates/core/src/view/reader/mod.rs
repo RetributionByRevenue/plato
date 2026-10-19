@@ -69,9 +69,6 @@ const HIGHLIGHT_DRIFT: u8 =  0x22;
 const MEM_SCHEME: &str = "mem:";
 // Pages rendered into the page cache beyond the two kept in memory.
 const PREFETCH_AHEAD: usize = 10;
-// Swipes starting within 1/8 of the screen height from the bottom (or top)
-// edge open (or close) the menu bars.
-const BAR_SWIPE_EDGE: i32 = 8;
 
 pub struct Reader {
     id: Id,
@@ -1544,6 +1541,19 @@ impl Reader {
         }
     }
 
+    // Whether a vertical or diagonal swipe should show (upwards) or hide
+    // (downwards) the bars. When the page fits the screen vertical swipes
+    // have no other use, so they count anywhere; otherwise they scroll, and
+    // only those starting in the bottom (or top) third count.
+    fn is_bar_swipe(&self, start: Point, end: Point) -> bool {
+        let up = end.y < start.y;
+        if self.view_port.zoom_mode == ZoomMode::FitToPage {
+            return true;
+        }
+        let third = self.rect.height() as i32 / 3;
+        if up { start.y >= self.rect.max.y - third } else { start.y < self.rect.min.y + third }
+    }
+
     fn toggle_bars(&mut self, enable: Option<bool>, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
         if let Some(top_index) = locate::<TopBar>(self) {
             if let Some(true) = enable {
@@ -2775,16 +2785,11 @@ impl View for Reader {
                 hub.send(Event::Select(EntryId::Rotate(n))).ok();
                 true
             },
-            // Swiping up from the bottom edge shows the menu bars, swiping
-            // down from the top edge hides them.
-            Event::Gesture(GestureEvent::Swipe { dir: Dir::North, start, .. })
-                if self.rect.includes(start) && start.y >= self.rect.max.y - self.rect.height() as i32 / BAR_SWIPE_EDGE => {
-                self.toggle_bars(Some(true), hub, rq, context);
-                true
-            },
-            Event::Gesture(GestureEvent::Swipe { dir: Dir::South, start, .. })
-                if self.rect.includes(start) && start.y < self.rect.min.y + self.rect.height() as i32 / BAR_SWIPE_EDGE => {
-                self.toggle_bars(Some(false), hub, rq, context);
+            // Swiping up shows the menu bars, swiping down hides them.
+            Event::Gesture(GestureEvent::Swipe { dir: Dir::North | Dir::South, start, end }) |
+            Event::Gesture(GestureEvent::SlantedSwipe { start, end, .. })
+                if self.rect.includes(start) && self.is_bar_swipe(start, end) => {
+                self.toggle_bars(Some(end.y < start.y), hub, rq, context);
                 true
             },
             Event::Gesture(GestureEvent::Swipe { dir, start, end }) if self.rect.includes(start) => {
