@@ -1,6 +1,7 @@
 use super::mupdf_sys::*;
 
 use std::fs;
+use lazy_static::lazy_static;
 use std::ptr;
 use std::slice;
 use std::char;
@@ -17,6 +18,10 @@ use crate::unit::pt_to_px;
 use crate::framebuffer::Pixmap;
 
 const USER_STYLESHEET: &str = "css/html-user.css";
+
+lazy_static! {
+    static ref PARALLEL_RENDER: bool = std::env::var("PLATO_PARALLEL_RENDER").map_or(true, |v| v != "0");
+}
 
 // MuPDF keeps some process-wide state (e.g. the OpenJPEG context in
 // load-jpx.c) that is only guarded by these locks. Every context we create
@@ -501,11 +506,9 @@ impl<'a> PdfPage<'a> {
             } else {
                 fz_device_rgb(self.ctx.0)
             };
-            let pixmap = mp_new_pixmap_from_page(self.ctx.0,
-                                                 self.page,
-                                                 mat,
-                                                 color_space,
-                                                 0);
+            // Draw the page on both cores, unless PLATO_PARALLEL_RENDER=0.
+            let render = if *PARALLEL_RENDER { mp_new_pixmap_from_page_parallel } else { mp_new_pixmap_from_page };
+            let pixmap = render(self.ctx.0, self.page, mat, color_space, 0);
             if pixmap.is_null() {
                 return None;
             }

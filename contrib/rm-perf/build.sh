@@ -18,6 +18,11 @@ IMAGE=ghcr.io/toltec-dev/rust:v4.0
 rsync -a --delete "$SRC/crates/" "$BLD/crates/" \
     --exclude 'core/build.rs'
 cp "$SRC/Cargo.toml" "$SRC/Cargo.lock" "$BLD/"
+# The C side of the MuPDF bindings (two-core page rendering lives there).
+if ! cmp -s "$SRC/mupdf_wrapper/mupdf_wrapper.c" "$BLD/mupdf_wrapper/mupdf_wrapper.c"; then
+    cp "$SRC/mupdf_wrapper/mupdf_wrapper.c" "$BLD/mupdf_wrapper/"
+    touch "$BLD/.wrapper-changed"
+fi
 
 read -r -d '' INNER <<'EOF' || true
 set -e
@@ -53,6 +58,12 @@ if [ "$MODE" = full ]; then
     env -u srcdir sh -e ./build.sh slow
     sh -ex ./dist.sh
 else
+    if [ -f .wrapper-changed ]; then
+        (cd mupdf_wrapper && CFLAGS="-O2 -fPIC -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard" ./build-kobo.sh)
+        # Cargo doesn't track the static library: make it relink.
+        touch crates/core/src/lib.rs
+        rm .wrapper-changed
+    fi
     cargo build --release --target "$CARGO_BUILD_TARGET" -p plato
     # Only the binary changes; libs, fonts and icons are already on the tablet.
     ${STRIP} -o target/plato-stripped "target/$CARGO_BUILD_TARGET/release/plato"

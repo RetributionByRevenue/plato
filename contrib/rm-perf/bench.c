@@ -5,6 +5,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <pthread.h>
+
+/* Same as Plato: real locks, so contexts can be cloned for threads. */
+static pthread_mutex_t mutexes[FZ_LOCK_MAX];
+static void lock(void *user, int i) { pthread_mutex_lock(&mutexes[i]); }
+static void unlock(void *user, int i) { pthread_mutex_unlock(&mutexes[i]); }
+static fz_locks_context locks = { NULL, lock, unlock };
+
+fz_pixmap *mp_new_pixmap_from_page_parallel(fz_context *ctx, fz_page *page, fz_matrix ctm, fz_colorspace *cs, int alpha);
 
 static double now_ms(void)
 {
@@ -39,7 +48,9 @@ static void time_image(fz_context *ctx, fz_image *img, const char *label, int w,
 
 int main(int argc, char **argv)
 {
-	fz_context *ctx = fz_new_context(NULL, NULL, 32 << 20);
+	for (int m = 0; m < FZ_LOCK_MAX; m++)
+		pthread_mutex_init(&mutexes[m], NULL);
+	fz_context *ctx = fz_new_context(NULL, &locks, 32 << 20);
 	fz_register_document_handlers(ctx);
 	fz_document *doc = fz_open_document(ctx, argv[1]);
 	int pno = atoi(argv[2]);
@@ -76,6 +87,34 @@ int main(int argc, char **argv)
 		printf("page %s: %7.0f ms (%dx%d)\n", i == 1 ? "warm" : "cold", now_ms() - t, pix->w, pix->h);
 		fz_drop_pixmap(ctx, pix);
 	}
+	/* Two cores (mupdf_wrapper.c), cold, compared with a one core render. */
+	{
+		fz_pixmap *ref, *par;
+		size_t k, diff = 0;
+		int maxd = 0;
+		fz_empty_store(ctx);
+		ref = fz_new_pixmap_from_page(ctx, page, fz_scale(zoom, zoom), fz_device_gray(ctx), 0);
+		for (i = 0; i < 2; i++)
+		{
+			fz_empty_store(ctx);
+			t = now_ms();
+			par = mp_new_pixmap_from_page_parallel(ctx, page, fz_scale(zoom, zoom), fz_device_gray(ctx), 0);
+			printf("page cold, two cores: %7.0f ms\n", now_ms() - t);
+			if (i == 0)
+			{
+				for (k = 0; k < (size_t)ref->stride * ref->h; k++)
+				{
+					int d = abs(ref->samples[k] - par->samples[k]);
+					if (d) diff++;
+					if (d > maxd) maxd = d;
+				}
+				printf("two cores vs one: %zu of %zu pixels differ, by at most %d\n", diff, (size_t)ref->stride * ref->h, maxd);
+			}
+			fz_drop_pixmap(ctx, par);
+		}
+		fz_drop_pixmap(ctx, ref);
+	}
+
 	fz_empty_store(ctx);
 	t = now_ms();
 	fz_display_list *list = fz_new_display_list_from_page(ctx, page);
