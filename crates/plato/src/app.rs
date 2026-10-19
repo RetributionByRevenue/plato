@@ -51,6 +51,8 @@ const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(299);
 const AUTO_SUSPEND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(15);
 const PREPARE_SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(3);
+// Gestures made while handling an event took longer than this are dropped.
+const STALE_INPUT_THRESHOLD: Duration = Duration::from_millis(250);
 
 #[allow(unused)]
 struct Task {
@@ -347,7 +349,11 @@ pub fn run() -> Result<(), Error> {
                   BATTERY_REFRESH_INTERVAL, &tx, &mut tasks);
     tx.send(Event::WakeUp).ok();
 
-    while let Ok(evt) = rx.recv() {
+    // Events taken off the channel while dropping stale gestures.
+    let mut pending: VecDeque<Event> = VecDeque::new();
+
+    while let Some(evt) = pending.pop_front().or_else(|| rx.recv().ok()) {
+        let handling_started = Instant::now();
         match evt {
             Event::Device(de) => {
                 match de {
@@ -1072,6 +1078,24 @@ pub fn run() -> Result<(), Error> {
 
         while let Some(ce) = bus.pop_front() {
             tx.send(ce).ok();
+        }
+
+        // Taps and swipes made while the screen was still catching up (a
+        // page that wasn't rendered yet, a book being opened) would act on a
+        // screen the user hasn't seen yet, e.g. turning two pages at once.
+        if handling_started.elapsed() >= STALE_INPUT_THRESHOLD {
+            let mut dropped = 0;
+            while let Ok(evt) = rx.try_recv() {
+                if matches!(evt, Event::Gesture(_)) {
+                    dropped += 1;
+                } else {
+                    pending.push_back(evt);
+                }
+            }
+            if dropped > 0 && *plato_core::helpers::TIMING {
+                eprintln!("[timing] dropped {} gesture(s) made during a {:.0} ms update",
+                          dropped, handling_started.elapsed().as_secs_f64() * 1000.0);
+            }
         }
     }
 

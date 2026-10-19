@@ -69,6 +69,9 @@ const HIGHLIGHT_DRIFT: u8 =  0x22;
 const MEM_SCHEME: &str = "mem:";
 // Pages rendered into the page cache beyond the two kept in memory.
 const PREFETCH_AHEAD: usize = 10;
+// Swipes starting within 1/8 of the screen height from the bottom (or top)
+// edge open (or close) the menu bars.
+const BAR_SWIPE_EDGE: i32 = 8;
 
 pub struct Reader {
     id: Id,
@@ -2770,6 +2773,18 @@ impl View for Reader {
                 let (_, dir) = CURRENT_DEVICE.mirroring_scheme();
                 let n = (4 + (context.display.rotation - dir * quarter_turns)) % 4;
                 hub.send(Event::Select(EntryId::Rotate(n))).ok();
+                true
+            },
+            // Swiping up from the bottom edge shows the menu bars, swiping
+            // down from the top edge hides them.
+            Event::Gesture(GestureEvent::Swipe { dir: Dir::North, start, .. })
+                if self.rect.includes(start) && start.y >= self.rect.max.y - self.rect.height() as i32 / BAR_SWIPE_EDGE => {
+                self.toggle_bars(Some(true), hub, rq, context);
+                true
+            },
+            Event::Gesture(GestureEvent::Swipe { dir: Dir::South, start, .. })
+                if self.rect.includes(start) && start.y < self.rect.min.y + self.rect.height() as i32 / BAR_SWIPE_EDGE => {
+                self.toggle_bars(Some(false), hub, rq, context);
                 true
             },
             Event::Gesture(GestureEvent::Swipe { dir, start, end }) if self.rect.includes(start) => {
