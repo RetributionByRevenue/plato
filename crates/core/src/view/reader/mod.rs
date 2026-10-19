@@ -244,7 +244,7 @@ impl Reader {
         let settings = &context.settings;
         let path = context.library.home.join(&info.file.path);
 
-        open(&path).and_then(|mut doc| {
+        timed!(format!("open {}", info.file.path.display()), open(&path)).and_then(|mut doc| {
             let (width, height) = context.display.dims;
             let font_size = info.reader.as_ref().and_then(|r| r.font_size)
                                 .unwrap_or(settings.reader.font_size);
@@ -468,10 +468,11 @@ impl Reader {
                                   .and_then(|r| r.cropping_margins.as_ref()
                                                  .map(|c| c.margin(location)))
                                   .cloned().unwrap_or_default();
-        let dims = doc.dims(location).unwrap_or((3.0, 4.0));
+        let dims = timed!(format!("dims p{}", location), doc.dims(location)).unwrap_or((3.0, 4.0));
         let screen_margin_width = self.view_port.margin_width;
         let scale = scaling_factor(&self.rect, &cropping_margin, screen_margin_width, dims, self.view_port.zoom_mode);
-        if let Some((pixmap, _)) = doc.pixmap(Location::Exact(location), scale, CURRENT_DEVICE.color_samples()) {
+        if let Some((pixmap, _)) = timed!(format!("pixmap p{} (ui thread)", location),
+                                          doc.pixmap(Location::Exact(location), scale, CURRENT_DEVICE.color_samples())) {
             let frame = rect![(cropping_margin.left * pixmap.width as f32).ceil() as i32,
                               (cropping_margin.top * pixmap.height as f32).ceil() as i32,
                               ((1.0 - cropping_margin.right) * pixmap.width as f32).floor() as i32,
@@ -493,7 +494,7 @@ impl Reader {
 
         let mut doc = self.doc.lock().unwrap();
         let loc = Location::Exact(location);
-        let words = doc.words(loc)
+        let words = timed!(format!("words p{}", location), doc.words(loc))
                        .map(|(words, _)| words)
                        .unwrap_or_default();
         self.text.insert(location, words);

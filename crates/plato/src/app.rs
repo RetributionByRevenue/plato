@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use plato_core::anyhow::{Error, Context as ResultExt, format_err};
 use plato_core::chrono::Local;
-use plato_core::framebuffer::{Framebuffer, RemarkableFramebuffer, UpdateMode};
+use plato_core::framebuffer::{Framebuffer, QtfbFramebuffer, RemarkableFramebuffer, UpdateMode};
 use plato_core::view::{View, Event, EntryId, EntryKind, ViewId, AppCmd, RenderData, RenderQueue, UpdateData};
 use plato_core::view::{handle_event, process_render_queue, wait_for_all};
 use plato_core::view::common::{locate, locate_by_id, transfer_notifications, overlapping_rectangle};
@@ -35,7 +35,7 @@ use plato_core::view::reader::Reader;
 use plato_core::view::dialog::Dialog;
 use plato_core::view::intermission::Intermission;
 use plato_core::view::notification::Notification;
-use plato_core::device::{CURRENT_DEVICE, Orientation, FrontlightKind};
+use plato_core::device::{CURRENT_DEVICE, Model, Orientation, FrontlightKind};
 use plato_core::library::Library;
 use plato_core::font::Fonts;
 use plato_core::rtc::Rtc;
@@ -213,7 +213,14 @@ pub fn run() -> Result<(), Error> {
         }
     }
 
-    let mut fb = Box::new(RemarkableFramebuffer::new().context("can't create framebuffer")?);
+    // Under AppLoad, draw straight into its qtfb buffer (PLATO_QTFB=0 opts out).
+    let use_qtfb = env::var_os("QTFB_KEY").is_some() &&
+                   env::var("PLATO_QTFB").map_or(true, |v| v != "0");
+    let mut fb: Box<dyn Framebuffer> = if use_qtfb {
+        Box::new(QtfbFramebuffer::new().context("can't connect to qtfb")?)
+    } else {
+        Box::new(RemarkableFramebuffer::new().context("can't create framebuffer")?)
+    };
     let initial_rotation = CURRENT_DEVICE.transformed_rotation(fb.rotation());
     let startup_rotation = CURRENT_DEVICE.startup_rotation();
     if !CURRENT_DEVICE.has_gyroscope() && initial_rotation != startup_rotation {
@@ -302,10 +309,14 @@ pub fn run() -> Result<(), Error> {
 
     context.fb.set_inverted(context.settings.inverted);
 
-    if context.settings.wifi {
-        Command::new("scripts/wifi-enable.sh").status().ok();
-    } else {
-        Command::new("scripts/wifi-disable.sh").status().ok();
+    // The Wi-Fi scripts are written for Kobo hardware; on a reMarkable they
+    // only cost process launches and a sleep, and xochitl owns Wi-Fi anyway.
+    if CURRENT_DEVICE.model != Model::Remarkable {
+        if context.settings.wifi {
+            Command::new("scripts/wifi-enable.sh").status().ok();
+        } else {
+            Command::new("scripts/wifi-disable.sh").status().ok();
+        }
     }
 
     if context.settings.frontlight {
