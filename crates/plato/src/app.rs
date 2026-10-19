@@ -53,6 +53,10 @@ const SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(15);
 const PREPARE_SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(3);
 // Gestures made while handling an event took longer than this are dropped.
 const STALE_INPUT_THRESHOLD: Duration = Duration::from_millis(250);
+// After an update covering most of the screen (a page turn), gestures are
+// ignored for this long: the e-ink panel needs it to show the new content.
+// PLATO_INPUT_COOLDOWN_MS overrides it.
+const INPUT_COOLDOWN: Duration = Duration::from_millis(500);
 
 #[allow(unused)]
 struct Task {
@@ -352,8 +356,24 @@ pub fn run() -> Result<(), Error> {
     // Events taken off the channel while dropping stale gestures.
     let mut pending: VecDeque<Event> = VecDeque::new();
 
+    // Until when the panel is still showing a large update (a new page).
+    let mut screen_settling_until: Option<Instant> = None;
+    let input_cooldown = env::var("PLATO_INPUT_COOLDOWN_MS").ok()
+                             .and_then(|v| v.parse::<u64>().ok())
+                             .map_or(INPUT_COOLDOWN, Duration::from_millis);
+
     while let Some(evt) = pending.pop_front().or_else(|| rx.recv().ok()) {
         let handling_started = Instant::now();
+
+        // A tap made before the new page is actually visible on the panel
+        // was aimed at the old page: repeated taps would skip pages.
+        if matches!(evt, Event::Gesture(_)) && screen_settling_until.is_some_and(|t| handling_started < t) {
+            if *plato_core::helpers::TIMING {
+                eprintln!("[timing] ignored {:?} while the screen settles", evt);
+            }
+            continue;
+        }
+
         match evt {
             Event::Device(de) => {
                 match de {
@@ -1075,6 +1095,11 @@ pub fn run() -> Result<(), Error> {
         }
 
         process_render_queue(view.as_ref(), &mut rq, &mut context, &mut updating);
+
+        let screen_area = context.fb.rect().area();
+        if updating.iter().any(|u| u.time >= handling_started && 2 * u.rect.area() >= screen_area) {
+            screen_settling_until = Some(Instant::now() + input_cooldown);
+        }
 
         while let Some(ce) = bus.pop_front() {
             tx.send(ce).ok();
