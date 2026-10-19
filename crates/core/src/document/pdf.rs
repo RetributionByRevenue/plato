@@ -18,6 +18,32 @@ use crate::framebuffer::Pixmap;
 
 const USER_STYLESHEET: &str = "css/html-user.css";
 
+// MuPDF keeps some process-wide state (e.g. the OpenJPEG context in
+// load-jpx.c) that is only guarded by these locks. Every context we create
+// must share them, otherwise rendering in two threads at once (reader and
+// thumbnail generation) corrupts memory and segfaults.
+struct MupdfMutexes([std::cell::UnsafeCell<libc::pthread_mutex_t>; FZ_LOCK_MAX]);
+
+unsafe impl Sync for MupdfMutexes {}
+
+static MUPDF_MUTEXES: MupdfMutexes = MupdfMutexes(
+    [const { std::cell::UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER) }; FZ_LOCK_MAX]
+);
+
+extern "C" fn mupdf_lock(_user: *mut libc::c_void, lock: libc::c_int) {
+    unsafe { libc::pthread_mutex_lock(MUPDF_MUTEXES.0[lock as usize].get()); }
+}
+
+extern "C" fn mupdf_unlock(_user: *mut libc::c_void, lock: libc::c_int) {
+    unsafe { libc::pthread_mutex_unlock(MUPDF_MUTEXES.0[lock as usize].get()); }
+}
+
+static MUPDF_LOCKS: FzLocksContext = FzLocksContext {
+    user: ptr::null_mut(),
+    lock: mupdf_lock,
+    unlock: mupdf_unlock,
+};
+
 impl Into<Boundary> for FzRect {
     fn into(self) -> Boundary {
         Boundary {
@@ -47,7 +73,7 @@ impl PdfOpener {
     pub fn new() -> Option<PdfOpener> {
         unsafe {
             let version = CString::new(FZ_VERSION).unwrap();
-            let ctx = fz_new_context_imp(ptr::null(), ptr::null(), CACHE_SIZE, version.as_ptr());
+            let ctx = fz_new_context_imp(ptr::null(), &MUPDF_LOCKS, CACHE_SIZE, version.as_ptr());
 
             if ctx.is_null() {
                 None

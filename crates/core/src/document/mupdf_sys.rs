@@ -30,7 +30,19 @@ pub enum FzDevice {}
 pub enum FzFont {}
 pub enum FzColorspace {}
 pub enum FzAllocContext {}
-pub enum FzLocksContext {}
+
+// FZ_LOCK_ALLOC, FZ_LOCK_FREETYPE, FZ_LOCK_GLYPHCACHE.
+pub const FZ_LOCK_MAX: usize = 3;
+
+#[repr(C)]
+pub struct FzLocksContext {
+    pub user: *mut libc::c_void,
+    pub lock: extern "C" fn(user: *mut libc::c_void, lock: libc::c_int),
+    pub unlock: extern "C" fn(user: *mut libc::c_void, lock: libc::c_int),
+}
+
+// Only holds function pointers and a null user pointer.
+unsafe impl Sync for FzLocksContext {}
 pub enum FzCookie {}
 pub enum FzStoreDropFn {}
 pub enum FzLinkSetRectFn {}
