@@ -4,7 +4,8 @@
 //! every rendered page is stored (zstd compressed) and reused the next time
 //! it's needed, including after Plato restarts. Only the book being read is
 //! kept: opening a book removes the pages of every other one. The cache is
-//! also bounded, and the least recently used pages are removed first.
+//! also bounded (100 MB, about 280 scanned pages), and the least recently
+//! used pages are removed first, while reading as well as on opening.
 //!
 //! PLATO_PAGE_CACHE=0 disables it, PLATO_PAGE_CACHE_MB sets its size.
 
@@ -13,16 +14,25 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use crate::framebuffer::Pixmap;
 use super::Resource;
 use super::prefetch::RenderParams;
 
 const MAGIC: &[u8; 8] = b"PLATOPC1";
-const DEFAULT_LIMIT_MB: u64 = 1024;
+const DEFAULT_LIMIT_MB: u64 = 100;
 
 pub struct PageCache {
     pub dir: PathBuf,
+    // Bytes this book's pages take, kept up to date as pages are stored.
+    used: AtomicU64,
+}
+
+fn limit() -> u64 {
+    std::env::var("PLATO_PAGE_CACHE_MB").ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LIMIT_MB) * 1024 * 1024
 }
 
 fn cache_root() -> Option<PathBuf> {
@@ -56,7 +66,8 @@ impl PageCache {
         meta.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs().hash(&mut h);
         let dir = root.join(format!("{:016x}", h.finish()));
         fs::create_dir_all(&dir).ok()?;
-        Some(PageCache { dir })
+        let used = cached_files(&dir).iter().map(|f| f.1).sum();
+        Some(PageCache { dir, used: AtomicU64::new(used) })
     }
 
     fn path(&self, location: usize, params: &RenderParams) -> PathBuf {
@@ -110,8 +121,43 @@ impl PageCache {
         })();
         if result.is_err() {
             fs::remove_file(&tmp).ok();
+            return;
+        }
+        let len = fs::metadata(&path).map_or(0, |m| m.len());
+        if self.used.fetch_add(len, Ordering::Relaxed) + len > limit() {
+            self.used.store(trim_dir(&self.dir, limit()), Ordering::Relaxed);
         }
     }
+}
+
+fn cached_files(dir: &Path) -> Vec<(SystemTime, u64, PathBuf)> {
+    walkdir::WalkDir::new(dir)
+        .into_iter().filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), e.into_path()))
+        }).collect()
+}
+
+// Removes the least recently used pages under `dir` until they fit in
+// `limit` bytes, and returns how many bytes are left.
+fn trim_dir(dir: &Path, limit: u64) -> u64 {
+    let mut files = cached_files(dir);
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= limit {
+        return total;
+    }
+    files.sort_by_key(|f| f.0);
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+    total
 }
 
 // Removes the pages of every book but the one in `keep`, then the least
@@ -130,27 +176,5 @@ pub fn trim_cache(keep: &Path) {
             }
         }
     }
-    let limit = std::env::var("PLATO_PAGE_CACHE_MB").ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_LIMIT_MB) * 1024 * 1024;
-    let mut files: Vec<(SystemTime, u64, PathBuf)> = walkdir::WalkDir::new(&root)
-        .into_iter().filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            Some((meta.modified().ok()?, meta.len(), e.into_path()))
-        }).collect();
-    let mut total: u64 = files.iter().map(|f| f.1).sum();
-    if total <= limit {
-        return;
-    }
-    files.sort_by_key(|f| f.0);
-    for (_, len, path) in files {
-        if total <= limit {
-            break;
-        }
-        if fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-        }
-    }
+    trim_dir(&root, limit());
 }
